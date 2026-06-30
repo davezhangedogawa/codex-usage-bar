@@ -15,9 +15,9 @@ Codex writes current thread usage-window updates into the active rollout JSONL s
 ~/.codex/state_5.sqlite
 ```
 
-The app reads the current thread's `rollout_path` from `state_5.sqlite`, then reads the latest `payload.rate_limits` object from that rollout file. It does not call the network and does not modify Codex data.
+The app reads recent thread `rollout_path` values from `state_5.sqlite`, scans each rollout tail for `payload.rate_limits`, and displays the newest rate-limit event by timestamp. It does not call the network and does not modify Codex data.
 
-To avoid repeatedly loading large session files, the app scans from the tail of the rollout JSONL file and stops when it finds the newest `rate_limits` event.
+To avoid repeatedly loading large session files, the app scans from the tail of each recent rollout JSONL file and stops when it finds that file's newest `rate_limits` event.
 
 ## Requirements
 
@@ -83,4 +83,4 @@ The important question is not "how do we draw a counter?", but "where does the t
 
 For this local Codex desktop setup, the best local source is the current thread rollout JSONL, not the broad SQLite logs table. The logs table also records prompts and tool calls, which can contain stale copies of rate-limit JSON and make a naive scraper drift away from the Codex UI.
 
-There is still one important limitation: "current thread" is inferred from the latest thread row in `state_5.sqlite`. If another Codex thread becomes more recent in the background, the menu bar can follow that thread instead. The app is deliberately read-only, local-only, and small, but this inference should be treated as a practical approximation of the Codex UI rather than a public API contract.
+There is still one important limitation: Codex's local state files are not a public API contract. The app deliberately treats them as a practical, read-only approximation of the Codex UI.

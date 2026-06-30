@@ -38,10 +38,25 @@ private final class RateLimitReader {
     }
 
     func read() throws -> RateLimitSnapshot {
-        let rolloutPath = try readCurrentRolloutPath()
-        latestSourcePath = rolloutPath
+        let candidates = try readRecentRolloutPaths().compactMap { path -> SnapshotCandidate? in
+            guard let content = try? readRolloutTail(from: path),
+                  let snapshot = parseSnapshot(from: content) else {
+                return nil
+            }
+            return SnapshotCandidate(path: path, snapshot: snapshot)
+        }
 
-        let content = try readRolloutTail(from: rolloutPath)
+        guard let newest = candidates.max(by: { lhs, rhs in
+            (lhs.snapshot.eventAt ?? .distantPast) < (rhs.snapshot.eventAt ?? .distantPast)
+        }) else {
+            throw ReaderError.noRateLimitEvent
+        }
+
+        latestSourcePath = newest.path
+        return newest.snapshot
+    }
+
+    private func parseSnapshot(from content: String) -> RateLimitSnapshot? {
         let decoder = JSONDecoder()
         let isoFormatter = ISO8601DateFormatter()
 
@@ -73,10 +88,10 @@ private final class RateLimitReader {
             )
         }
 
-        throw ReaderError.noRateLimitEvent
+        return nil
     }
 
-    private func readCurrentRolloutPath() throws -> String {
+    private func readRecentRolloutPaths() throws -> [String] {
         guard FileManager.default.fileExists(atPath: stateDbPath) else {
             throw ReaderError.databaseMissing(stateDbPath)
         }
@@ -86,18 +101,19 @@ private final class RateLimitReader {
         FROM threads
         WHERE rollout_path <> ''
         ORDER BY recency_at_ms DESC, updated_at_ms DESC, updated_at DESC
-        LIMIT 1;
+        LIMIT 8;
         """
 
-        let path = try runSQLite(dbPath: stateDbPath, sql: sql).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !path.isEmpty else {
+        let paths = try runSQLite(dbPath: stateDbPath, sql: sql)
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) }
+
+        guard !paths.isEmpty else {
             throw ReaderError.noRolloutPath
         }
-        guard FileManager.default.fileExists(atPath: path) else {
-            throw ReaderError.databaseMissing(path)
-        }
 
-        return path
+        return paths
     }
 
     private func readRolloutTail(from path: String) throws -> String {
@@ -188,6 +204,11 @@ private final class RateLimitReader {
             }
         }
     }
+}
+
+private struct SnapshotCandidate {
+    let path: String
+    let snapshot: RateLimitSnapshot
 }
 
 private struct SessionRolloutLine: Decodable {
