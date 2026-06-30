@@ -14,7 +14,7 @@ mkdir -p "$LOG_DIR"
 
 if [ -f "$PID_FILE" ]; then
   PID="$(cat "$PID_FILE")"
-  if kill -0 "$PID" 2>/dev/null; then
+  if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     echo "Codex Token Bar is already running (pid $PID)."
     exit 0
   fi
@@ -34,7 +34,10 @@ fi
 
 if open "$APP_DIR"; then
   sleep 1
-  pgrep -f "$BINARY" | head -n 1 > "$PID_FILE" || true
+  STARTED_PID="$(pgrep -f "$BINARY" | head -n 1 || true)"
+  if [ -n "$STARTED_PID" ]; then
+    echo "$STARTED_PID" > "$PID_FILE"
+  fi
   echo "Started Codex Token Bar."
 else
   nohup "$BINARY" > "$LOG_FILE" 2>&1 &

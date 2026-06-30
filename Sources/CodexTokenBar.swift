@@ -1,6 +1,8 @@
 import Cocoa
 
 private struct RateLimitSnapshot: Codable {
+    let sourcePath: String?
+    let readAt: Date?
     let planType: String
     let allowed: Bool
     let limitReached: Bool
@@ -31,6 +33,7 @@ private final class RateLimitReader {
 
     private let stateDbPath: String
     private var latestSourcePath: String
+    private var snapshotCache: [String: CachedRolloutSnapshot] = [:]
 
     init(stateDbPath: String = "\(NSHomeDirectory())/.codex/state_5.sqlite") {
         self.stateDbPath = stateDbPath
@@ -39,10 +42,24 @@ private final class RateLimitReader {
 
     func read() throws -> RateLimitSnapshot {
         let candidates = try readRecentRolloutPaths().compactMap { path -> SnapshotCandidate? in
-            guard let content = try? readRolloutTail(from: path),
-                  let snapshot = parseSnapshot(from: content) else {
+            guard let fileState = try? fileState(for: path) else {
                 return nil
             }
+            if let cached = snapshotCache[path],
+               cached.fileSize == fileState.size,
+               cached.modifiedAt == fileState.modifiedAt {
+                return SnapshotCandidate(path: path, snapshot: cached.snapshot)
+            }
+
+            guard let content = try? readRolloutTail(from: path),
+                  let snapshot = parseSnapshot(from: content, sourcePath: path) else {
+                return nil
+            }
+            snapshotCache[path] = CachedRolloutSnapshot(
+                fileSize: fileState.size,
+                modifiedAt: fileState.modifiedAt,
+                snapshot: snapshot
+            )
             return SnapshotCandidate(path: path, snapshot: snapshot)
         }
 
@@ -56,7 +73,7 @@ private final class RateLimitReader {
         return newest.snapshot
     }
 
-    private func parseSnapshot(from content: String) -> RateLimitSnapshot? {
+    private func parseSnapshot(from content: String, sourcePath: String) -> RateLimitSnapshot? {
         let decoder = JSONDecoder()
         let isoFormatter = ISO8601DateFormatter()
 
@@ -75,6 +92,8 @@ private final class RateLimitReader {
             let eventAt = event.timestamp.flatMap { isoFormatter.date(from: $0) }
 
             return RateLimitSnapshot(
+                sourcePath: sourcePath,
+                readAt: Date(),
                 planType: rateLimits.planType ?? "unknown",
                 allowed: !limitReached,
                 limitReached: limitReached,
@@ -151,6 +170,13 @@ private final class RateLimitReader {
         throw ReaderError.noRateLimitEvent
     }
 
+    private func fileState(for path: String) throws -> FileState {
+        let attributes = try FileManager.default.attributesOfItem(atPath: path)
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        let modifiedAt = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+        return FileState(size: size, modifiedAt: modifiedAt)
+    }
+
     private static func clampedRoundedPercent(_ value: Double) -> Int {
         min(100, max(0, Int(value.rounded())))
     }
@@ -211,6 +237,17 @@ private struct SnapshotCandidate {
     let snapshot: RateLimitSnapshot
 }
 
+private struct CachedRolloutSnapshot {
+    let fileSize: UInt64
+    let modifiedAt: TimeInterval
+    let snapshot: RateLimitSnapshot
+}
+
+private struct FileState {
+    let size: UInt64
+    let modifiedAt: TimeInterval
+}
+
 private struct SessionRolloutLine: Decodable {
     let timestamp: String?
     let type: String
@@ -257,6 +294,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let maxLogBytes: UInt64 = 1 * 1024 * 1024
     private static let repeatedErrorLogInterval: TimeInterval = 15 * 60
     private static let cachedSnapshotKey = "lastGoodRateLimitSnapshot"
+    private static let maxSnapshotAge: TimeInterval = 6 * 60 * 60
 
     private let reader = RateLimitReader()
     private let statusItem = NSStatusBar.system.statusItem(withLength: 136)
@@ -299,6 +337,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         do {
             let snapshot = try reader.read()
+            guard isSnapshotDisplayable(snapshot) else {
+                throw DisplayError.snapshotExpired
+            }
             latestSnapshot = snapshot
             latestSnapshotIsStale = false
             latestError = nil
@@ -306,10 +347,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             updateStatusItem(with: snapshot, isStale: false)
         } catch {
             latestError = error
-            if let snapshot = latestSnapshot {
+            if let snapshot = latestSnapshot, isSnapshotDisplayable(snapshot) {
                 latestSnapshotIsStale = true
                 updateStatusItem(with: snapshot, isStale: true)
             } else {
+                latestSnapshot = nil
+                latestSnapshotIsStale = false
                 statusItem.button?.title = "S -- W --"
                 statusItem.button?.toolTip = "Codex usage is not available yet: \(error.localizedDescription)"
             }
@@ -330,6 +373,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
             addHeader("Details", to: menu)
             addValue("Freshness", value: latestSnapshotIsStale ? "last known value" : "live", to: menu)
+            if let readAt = snapshot.readAt {
+                addValue("Read age", value: formatAge(since: readAt), to: menu)
+            }
             addValue("Current session used", value: "\(snapshot.sessionUsedPercent)%", to: menu)
             addValue("This week used", value: formatPercent(snapshot.weekUsedPercent), to: menu)
             addValue("Plan", value: snapshot.planType, to: menu)
@@ -343,6 +389,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let eventAt = snapshot.eventAt {
                 addValue("Last updated", value: Self.dateFormatter.string(from: eventAt), to: menu)
+            }
+            if let sourcePath = snapshot.sourcePath {
+                addValue("Source", value: sourcePath, to: menu)
             }
         } else {
             addHeader("Usage Pending", to: menu)
@@ -405,7 +454,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         Codex this week remaining: \(formatPercent(snapshot.weekRemainingPercent))\(latestSnapshotIsStale ? " (last known)" : "")
         Current session used: \(snapshot.sessionUsedPercent)%
         This week used: \(formatPercent(snapshot.weekUsedPercent))
-        Source: \(reader.sourceDescription)
+        Source: \(snapshot.sourcePath ?? reader.sourceDescription)
         """
 
         NSPasteboard.general.clearContents()
@@ -433,6 +482,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
               let snapshot = try? JSONDecoder().decode(RateLimitSnapshot.self, from: data) else {
             return
         }
+        guard isSnapshotDisplayable(snapshot) else {
+            UserDefaults.standard.removeObject(forKey: Self.cachedSnapshotKey)
+            return
+        }
 
         latestSnapshot = snapshot
         latestSnapshotIsStale = true
@@ -447,7 +500,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusItem(with snapshot: RateLimitSnapshot, isStale: Bool) {
         statusItem.button?.title = "S \(snapshot.sessionRemainingPercent)% W \(formatPercent(snapshot.weekRemainingPercent))"
         let prefix = isStale ? "Codex remaining (last known)" : "Codex remaining"
-        statusItem.button?.toolTip = "\(prefix): session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent))"
+        let age = isStale ? ", read \(formatAge(since: snapshot.readAt))" : ""
+        statusItem.button?.toolTip = "\(prefix): session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent))\(age)"
+    }
+
+    private func isSnapshotDisplayable(_ snapshot: RateLimitSnapshot) -> Bool {
+        let now = Date()
+        if let sessionResetAt = snapshot.sessionResetAt, sessionResetAt <= now {
+            return false
+        }
+        if let basis = snapshot.readAt ?? snapshot.eventAt,
+           now.timeIntervalSince(basis) > Self.maxSnapshotAge {
+            return false
+        }
+        return true
+    }
+
+    private func formatAge(since date: Date?) -> String {
+        guard let date else { return "unknown" }
+
+        let seconds = max(0, Int(Date().timeIntervalSince(date)))
+        if seconds < 60 {
+            return "<1m ago"
+        }
+        let minutes = seconds / 60
+        if minutes < 60 {
+            return "\(minutes)m ago"
+        }
+        return "\(minutes / 60)h ago"
     }
 
     private func log(_ message: String) {
@@ -496,6 +576,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func formatRemaining(_ value: Int?) -> String {
         value.map { "\($0)% remaining" } ?? "unavailable"
+    }
+
+    private enum DisplayError: LocalizedError {
+        case snapshotExpired
+
+        var errorDescription: String? {
+            "The last Codex usage snapshot has expired and no fresh rate_limits payload is available yet."
+        }
     }
 }
 

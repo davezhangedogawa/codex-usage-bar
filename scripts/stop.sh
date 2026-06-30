@@ -8,7 +8,7 @@ PID_FILE="$RUN_DIR/codex-token-bar.pid"
 
 if [ -f "$PID_FILE" ]; then
   PID="$(cat "$PID_FILE")"
-  if kill -0 "$PID" 2>/dev/null; then
+  if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     kill "$PID"
     rm -f "$PID_FILE"
     echo "Stopped Codex Token Bar."
