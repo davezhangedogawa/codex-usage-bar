@@ -1,6 +1,6 @@
 import Cocoa
 
-private struct RateLimitSnapshot {
+private struct RateLimitSnapshot: Codable {
     let planType: String
     let allowed: Bool
     let limitReached: Bool
@@ -235,11 +235,13 @@ private struct SessionRateLimitWindow: Decodable {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let maxLogBytes: UInt64 = 1 * 1024 * 1024
     private static let repeatedErrorLogInterval: TimeInterval = 15 * 60
+    private static let cachedSnapshotKey = "lastGoodRateLimitSnapshot"
 
     private let reader = RateLimitReader()
     private let statusItem = NSStatusBar.system.statusItem(withLength: 136)
     private var timer: Timer?
     private var latestSnapshot: RateLimitSnapshot?
+    private var latestSnapshotIsStale = false
     private var latestError: Error?
     private var lastLoggedErrorMessage: String?
     private var lastLoggedErrorAt: Date?
@@ -265,6 +267,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             log("status item button was nil")
         }
 
+        restoreCachedSnapshot()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             self?.refresh()
@@ -276,13 +279,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let snapshot = try reader.read()
             latestSnapshot = snapshot
+            latestSnapshotIsStale = false
             latestError = nil
-            statusItem.button?.title = "S \(snapshot.sessionRemainingPercent)% W \(formatPercent(snapshot.weekRemainingPercent))"
-            statusItem.button?.toolTip = "Codex remaining: session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent))"
+            cacheSnapshot(snapshot)
+            updateStatusItem(with: snapshot, isStale: false)
         } catch {
             latestError = error
-            statusItem.button?.title = "Usage !"
-            statusItem.button?.toolTip = error.localizedDescription
+            if let snapshot = latestSnapshot {
+                latestSnapshotIsStale = true
+                updateStatusItem(with: snapshot, isStale: true)
+            } else {
+                statusItem.button?.title = "S -- W --"
+                statusItem.button?.toolTip = "Codex usage is not available yet: \(error.localizedDescription)"
+            }
             logErrorIfNeeded(error.localizedDescription)
         }
 
@@ -293,12 +302,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         if let snapshot = latestSnapshot {
-            addHeader("Usage Remaining", to: menu)
+            addHeader(latestSnapshotIsStale ? "Usage Remaining (Last Known)" : "Usage Remaining", to: menu)
             addValue("Current session", value: "\(snapshot.sessionRemainingPercent)% remaining", to: menu)
             addValue("This week", value: formatRemaining(snapshot.weekRemainingPercent), to: menu)
 
             menu.addItem(.separator())
             addHeader("Details", to: menu)
+            addValue("Freshness", value: latestSnapshotIsStale ? "last known value" : "live", to: menu)
             addValue("Current session used", value: "\(snapshot.sessionUsedPercent)%", to: menu)
             addValue("This week used", value: formatPercent(snapshot.weekUsedPercent), to: menu)
             addValue("Plan", value: snapshot.planType, to: menu)
@@ -313,6 +323,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             if let eventAt = snapshot.eventAt {
                 addValue("Last updated", value: Self.dateFormatter.string(from: eventAt), to: menu)
             }
+        } else {
+            addHeader("Usage Pending", to: menu)
+            addValue("Status", value: "waiting for first rate_limits payload", to: menu)
         }
 
         if let error = latestError {
@@ -367,8 +380,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let snapshot = latestSnapshot else { return }
 
         let text = """
-        Codex current session remaining: \(snapshot.sessionRemainingPercent)%
-        Codex this week remaining: \(formatPercent(snapshot.weekRemainingPercent))
+        Codex current session remaining: \(snapshot.sessionRemainingPercent)%\(latestSnapshotIsStale ? " (last known)" : "")
+        Codex this week remaining: \(formatPercent(snapshot.weekRemainingPercent))\(latestSnapshotIsStale ? " (last known)" : "")
         Current session used: \(snapshot.sessionUsedPercent)%
         This week used: \(formatPercent(snapshot.weekUsedPercent))
         Source: \(reader.sourceDescription)
@@ -393,6 +406,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         formatter.timeStyle = .medium
         return formatter
     }()
+
+    private func restoreCachedSnapshot() {
+        guard let data = UserDefaults.standard.data(forKey: Self.cachedSnapshotKey),
+              let snapshot = try? JSONDecoder().decode(RateLimitSnapshot.self, from: data) else {
+            return
+        }
+
+        latestSnapshot = snapshot
+        latestSnapshotIsStale = true
+        updateStatusItem(with: snapshot, isStale: true)
+    }
+
+    private func cacheSnapshot(_ snapshot: RateLimitSnapshot) {
+        guard let data = try? JSONEncoder().encode(snapshot) else { return }
+        UserDefaults.standard.set(data, forKey: Self.cachedSnapshotKey)
+    }
+
+    private func updateStatusItem(with snapshot: RateLimitSnapshot, isStale: Bool) {
+        statusItem.button?.title = "S \(snapshot.sessionRemainingPercent)% W \(formatPercent(snapshot.weekRemainingPercent))"
+        let prefix = isStale ? "Codex remaining (last known)" : "Codex remaining"
+        statusItem.button?.toolTip = "\(prefix): session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent))"
+    }
 
     private func log(_ message: String) {
         let timestamp = ISO8601DateFormatter().string(from: Date())

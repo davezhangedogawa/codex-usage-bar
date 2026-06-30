@@ -59,6 +59,8 @@ You should see an `S 79% W 97%` style item in the macOS menu bar. Click it to se
 - reset times
 - source database path
 
+If the current Codex session has not written a fresh `rate_limits` payload yet, the menu bar keeps showing the last known good values and marks them as last known in the tooltip/menu. On a fresh install with no cached value yet, it shows `S -- W --` until the first usable payload appears.
+
 To stop it:
 
 ```bash
