@@ -2,11 +2,14 @@
 
 A tiny macOS menu bar utility that shows Codex and Claude usage remaining.
 
-The menu bar text is intentionally compact and the item sizes itself to fit (no icon, variable width):
+The menu bar item renders two stacked lines so all four values are visible at a glance:
 
-- `S`: Codex remaining percentage in the current 300-minute session window
-- `W`: Codex remaining percentage in the weekly window, or `--` when Codex has not provided a weekly window
-- `C`: Claude remaining percentage in the current 5-hour window, or `--` when unavailable (Claude weekly remaining is shown in the click menu)
+```text
+Codex  S79 W97   <- Codex: session / weekly remaining
+Claude S82 W64   <- Claude: session / weekly remaining
+```
+
+`S` means the current session window (`300` minutes for Codex, `5` hours for Claude). `W` means the weekly window. Unavailable values show as `--`. Any value below 25% remaining turns orange, below 10% red. On a dark menu bar the text is white with a subtle dark shadow for visibility over translucent wallpaper; on a light menu bar it switches to dark text. Hover for exact details, click for the full menu.
 
 ## What It Reads
 
@@ -64,10 +67,10 @@ build/Codex Token Bar.app
 ./scripts/start.sh
 ```
 
-You should see an `S 79% W 97% C 82%` style item in the macOS menu bar. Click it to see, for each of Codex and Claude:
+You should see a compact two-line `Codex S79 W97 / Claude S82 W64` item in the macOS menu bar. Click it to see, for each of Codex and Claude:
 
-- current session remaining
-- this week remaining
+- session remaining (`S`)
+- weekly remaining (`W`)
 - reset times
 - data freshness and source
 

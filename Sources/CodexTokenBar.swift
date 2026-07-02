@@ -15,7 +15,7 @@ private enum ISO8601Parsing {
     }
 }
 
-// MARK: - Subprocess helper (reads pipes before waiting to avoid pipe-buffer deadlock)
+// MARK: - Subprocess helper
 
 private enum Subprocess {
     struct Output {
@@ -28,6 +28,10 @@ private enum Subprocess {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
+        let outputQueue = DispatchQueue(label: "codex-token-bar.subprocess-output")
+        let drainGroup = DispatchGroup()
+        var stdoutData = Data()
+        var stderrData = Data()
 
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -35,17 +39,44 @@ private enum Subprocess {
         process.standardError = stderrPipe
 
         try process.run()
-        // Drain both pipes BEFORE waitUntilExit. Waiting first can deadlock
-        // when a child writes more than the 64 KB pipe buffer.
-        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
 
-        return Output(
-            status: process.terminationStatus,
-            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-            stderr: String(data: stderrData, encoding: .utf8) ?? ""
-        )
+        // Drain both pipes concurrently so neither can fill its 64 KB buffer
+        // and block the child. The handler is the ONLY reader of each handle
+        // (mixing readabilityHandler with readDataToEndOfFile races), and it
+        // uninstalls itself on EOF so it never spins on empty reads. Handlers
+        // are installed after run(); the microseconds in between only buffer
+        // into the pipe and are drained immediately afterwards.
+        func startDraining(_ handle: FileHandle, into append: @escaping (Data) -> Void) {
+            drainGroup.enter()
+            handle.readabilityHandler = { handle in
+                let chunk = handle.availableData
+                if chunk.isEmpty {
+                    handle.readabilityHandler = nil
+                    drainGroup.leave()
+                } else {
+                    append(chunk)
+                }
+            }
+        }
+        startDraining(stdoutPipe.fileHandleForReading) { chunk in
+            outputQueue.sync { stdoutData.append(chunk) }
+        }
+        startDraining(stderrPipe.fileHandleForReading) { chunk in
+            outputQueue.sync { stderrData.append(chunk) }
+        }
+
+        process.waitUntilExit()
+        // EOF is guaranteed shortly after exit for these tools; the timeout is
+        // a safety net so a stuck pipe degrades to truncated output, not a hang.
+        _ = drainGroup.wait(timeout: .now() + 10)
+
+        return outputQueue.sync {
+            Output(
+                status: process.terminationStatus,
+                stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+                stderr: String(data: stderrData, encoding: .utf8) ?? ""
+            )
+        }
     }
 }
 
@@ -551,6 +582,47 @@ private struct FlexibleDate: Decodable {
 
 // MARK: - App
 
+/// Colors for the status-bar text, resolved per menu bar appearance.
+private struct MenuBarPalette {
+    let base: NSColor
+    let dimmed: NSColor
+    let shadow: NSShadow?
+
+    init(isDark: Bool) {
+        if isDark {
+            base = .white
+            dimmed = NSColor.white.withAlphaComponent(0.65)
+            let s = NSShadow()
+            s.shadowColor = NSColor.black.withAlphaComponent(0.8)
+            s.shadowOffset = NSSize(width: 0, height: -1)
+            s.shadowBlurRadius = 1.5
+            shadow = s
+        } else {
+            base = .black
+            dimmed = NSColor.black.withAlphaComponent(0.6)
+            shadow = nil
+        }
+    }
+
+    func color(forRemaining value: Int?) -> NSColor {
+        guard let value else { return dimmed }
+        if value < 10 { return .systemRed }
+        if value < 25 { return .systemOrange }
+        return base
+    }
+
+    func attributes(font: NSFont, color: NSColor) -> [NSAttributedString.Key: Any] {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: color
+        ]
+        if let shadow {
+            attributes[.shadow] = shadow
+        }
+        return attributes
+    }
+}
+
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let maxLogBytes: UInt64 = 1 * 1024 * 1024
     private static let repeatedErrorLogInterval: TimeInterval = 15 * 60
@@ -562,9 +634,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let codexReader = RateLimitReader()
     private let claudeReader = ClaudeUsageReader()
-    // All reads (file IO, subprocesses, network) run on this serial queue so
-    // the main thread never blocks; results are applied back on main.
-    private let refreshQueue = DispatchQueue(label: "codex-token-bar.refresh", qos: .utility)
+    // Reads run away from the main thread. Codex and Claude use separate
+    // queues so a slow network request cannot delay local Codex updates.
+    private let codexRefreshQueue = DispatchQueue(label: "codex-token-bar.codex-refresh", qos: .utility)
+    private let claudeRefreshQueue = DispatchQueue(label: "codex-token-bar.claude-refresh", qos: .utility)
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var codexTimer: Timer?
@@ -594,11 +667,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         log("applicationDidFinishLaunching")
 
         if let button = statusItem.button {
-            button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .semibold)
-            button.toolTip = "Codex and Claude usage remaining"
+            button.imagePosition = .imageOnly
+            button.toolTip = "Codex and Claude usage remaining: S=session, W=weekly"
             log("status item button configured")
         } else {
             log("status item button was nil")
+        }
+
+        // Re-render the two-line image when the system theme flips, so the
+        // resolved label colors match the new appearance immediately.
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateStatusItem()
         }
 
         restoreCachedSnapshots()
@@ -624,7 +707,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !codexRefreshInFlight else { return }
         codexRefreshInFlight = true
 
-        refreshQueue.async { [weak self] in
+        codexRefreshQueue.async { [weak self] in
             guard let self else { return }
             let result = Result { try self.codexReader.read() }
             DispatchQueue.main.async {
@@ -638,7 +721,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !claudeRefreshInFlight else { return }
         claudeRefreshInFlight = true
 
-        refreshQueue.async { [weak self] in
+        claudeRefreshQueue.async { [weak self] in
             guard let self else { return }
             let result = Result { try self.claudeReader.read() }
             DispatchQueue.main.async {
@@ -707,35 +790,85 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: Status item
 
     private func updateStatusItem() {
-        let codexPart: String
-        if let snapshot = latestCodexSnapshot {
-            codexPart = "S \(snapshot.sessionRemainingPercent)% W \(formatPercent(snapshot.weekRemainingPercent))"
-        } else {
-            codexPart = "S -- W --"
-        }
+        guard let button = statusItem.button else { return }
+        button.image = renderStatusImage()
+        button.imagePosition = .imageOnly
+        button.title = ""
+        button.toolTip = tooltipText()
+    }
 
-        let claudePart: String
-        if let snapshot = latestClaudeSnapshot {
-            claudePart = "C \(snapshot.sessionRemainingPercent)%"
-        } else {
-            claudePart = "C --"
-        }
+    /// Draws the four remaining-percent values as two tiny stacked lines.
+    /// Provider names are included because ambiguous one-letter prefixes make
+    /// it too easy to confuse Codex, Claude, session, and weekly windows.
+    /// Text color follows the menu bar appearance: white with a subtle dark
+    /// shadow on a dark/translucent bar (readable over busy wallpaper), plain
+    /// dark text on a light bar (forced white would vanish there).
+    /// Values below 25% remaining turn orange, below 10% red.
+    private func renderStatusImage() -> NSImage {
+        let font = NSFont.monospacedSystemFont(ofSize: 9, weight: .semibold)
+        let appearance = statusItem.button?.effectiveAppearance ?? NSApp.effectiveAppearance
+        let palette = MenuBarPalette(isDark: appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua)
 
-        statusItem.button?.title = "\(codexPart) \(claudePart)"
-        statusItem.button?.toolTip = tooltipText()
+        let top = providerStatusLine(
+            provider: "Codex",
+            session: latestCodexSnapshot?.sessionRemainingPercent,
+            week: latestCodexSnapshot?.weekRemainingPercent,
+            font: font,
+            palette: palette
+        )
+        let bottom = providerStatusLine(
+            provider: "Claude",
+            session: latestClaudeSnapshot?.sessionRemainingPercent,
+            week: latestClaudeSnapshot?.weekRemainingPercent,
+            font: font,
+            palette: palette
+        )
+
+        let lineHeight: CGFloat = 10
+        let width = ceil(max(top.size().width, bottom.size().width)) + 2
+        let image = NSImage(size: NSSize(width: width, height: lineHeight * 2))
+
+        appearance.performAsCurrentDrawingAppearance {
+            image.lockFocus()
+            top.draw(at: NSPoint(x: 1, y: lineHeight))
+            bottom.draw(at: NSPoint(x: 1, y: 0))
+            image.unlockFocus()
+        }
+        image.isTemplate = false
+        return image
+    }
+
+    private func providerStatusLine(provider: String, session: Int?, week: Int?, font: NSFont, palette: MenuBarPalette) -> NSAttributedString {
+        // Pad provider names to equal length so the S/W columns of the two
+        // monospaced lines align vertically.
+        let paddedProvider = provider.padding(toLength: 6, withPad: " ", startingAt: 0)
+        let result = NSMutableAttributedString()
+        result.append(NSAttributedString(string: paddedProvider, attributes: palette.attributes(font: font, color: palette.dimmed)))
+        result.append(statusToken(label: " S", value: session, font: font, palette: palette))
+        result.append(statusToken(label: " W", value: week, font: font, palette: palette))
+        return result
+    }
+
+    private func statusToken(label: String, value: Int?, font: NSFont, palette: MenuBarPalette) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: label, attributes: palette.attributes(font: font, color: palette.dimmed))
+        result.append(NSAttributedString(
+            string: value.map(String.init) ?? "--",
+            attributes: palette.attributes(font: font, color: palette.color(forRemaining: value))
+        ))
+        return result
     }
 
     private func tooltipText() -> String {
         var lines: [String] = []
         if let snapshot = latestCodexSnapshot {
             let suffix = codexSnapshotIsStale ? " (last known, read \(formatAge(since: snapshot.readAt)))" : ""
-            lines.append("Codex: session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
+            lines.append("Codex: session (S) \(snapshot.sessionRemainingPercent)%, weekly (W) \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
         } else {
             lines.append("Codex usage is not available yet\(latestCodexError.map { ": \($0.localizedDescription)" } ?? "")")
         }
         if let snapshot = latestClaudeSnapshot {
             let suffix = claudeSnapshotIsStale ? " (last known, read \(formatAge(since: snapshot.readAt)))" : ""
-            lines.append("Claude: session \(snapshot.sessionRemainingPercent)%, week \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
+            lines.append("Claude: session (S) \(snapshot.sessionRemainingPercent)%, weekly (W) \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
         } else {
             lines.append("Claude usage is not available yet\(latestClaudeError.map { ": \($0.localizedDescription)" } ?? "")")
         }
@@ -747,10 +880,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildMenu() {
         let menu = NSMenu()
 
-        addHeader(codexSnapshotIsStale ? "Codex (Last Known)" : "Codex", to: menu)
+        addHeader(codexSnapshotIsStale ? "Codex Usage (Last Known)" : "Codex Usage", to: menu)
         if let snapshot = latestCodexSnapshot {
-            addValue("Current session", value: "\(snapshot.sessionRemainingPercent)% remaining", to: menu)
-            addValue("This week", value: formatRemaining(snapshot.weekRemainingPercent), to: menu)
+            addValue("Session remaining (S)", value: "\(snapshot.sessionRemainingPercent)%", to: menu)
+            addValue("Weekly remaining (W)", value: formatPercent(snapshot.weekRemainingPercent), to: menu)
             addValue("Plan", value: snapshot.planType, to: menu)
             addValue("Status", value: snapshot.limitReached ? "limit reached" : (snapshot.allowed ? "allowed" : "not allowed"), to: menu)
             if let sessionReset = snapshot.sessionResetAt {
@@ -773,10 +906,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         menu.addItem(.separator())
-        addHeader(claudeSnapshotIsStale ? "Claude (Last Known)" : "Claude", to: menu)
+        addHeader(claudeSnapshotIsStale ? "Claude Usage (Last Known)" : "Claude Usage", to: menu)
         if let snapshot = latestClaudeSnapshot {
-            addValue("Current session", value: "\(snapshot.sessionRemainingPercent)% remaining", to: menu)
-            addValue("This week", value: formatRemaining(snapshot.weekRemainingPercent), to: menu)
+            addValue("Session remaining (S)", value: "\(snapshot.sessionRemainingPercent)%", to: menu)
+            addValue("Weekly remaining (W)", value: formatPercent(snapshot.weekRemainingPercent), to: menu)
             if let sessionReset = snapshot.sessionResetAt {
                 addValue("Session resets", value: Self.dateFormatter.string(from: sessionReset), to: menu)
             }
@@ -841,14 +974,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         var lines: [String] = []
         if let snapshot = latestCodexSnapshot {
             let suffix = codexSnapshotIsStale ? " (last known)" : ""
-            lines.append("Codex session remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
-            lines.append("Codex week remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
+            lines.append("Codex session (S) remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
+            lines.append("Codex weekly (W) remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
             lines.append("Codex source: \(snapshot.sourcePath ?? codexReader.sourceDescription)")
         }
         if let snapshot = latestClaudeSnapshot {
             let suffix = claudeSnapshotIsStale ? " (last known)" : ""
-            lines.append("Claude session remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
-            lines.append("Claude week remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
+            lines.append("Claude session (S) remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
+            lines.append("Claude weekly (W) remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
         }
         guard !lines.isEmpty else { return }
 
@@ -981,10 +1114,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func formatPercent(_ value: Int?) -> String {
         value.map { "\($0)%" } ?? "--"
-    }
-
-    private func formatRemaining(_ value: Int?) -> String {
-        value.map { "\($0)% remaining" } ?? "unavailable"
     }
 
     private enum DisplayError: LocalizedError {
