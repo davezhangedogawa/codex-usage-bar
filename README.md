@@ -1,13 +1,16 @@
 # Codex Usage Bar
 
-A tiny macOS menu bar utility that shows Codex usage remaining from the current local Codex session.
+A tiny macOS menu bar utility that shows Codex and Claude usage remaining.
 
-The menu bar text is intentionally compact:
+The menu bar text is intentionally compact and the item sizes itself to fit (no icon, variable width):
 
-- `S`: remaining percentage in the current 300-minute session window
-- `W`: remaining percentage in the weekly window, or `--` when Codex has not provided a weekly window
+- `S`: Codex remaining percentage in the current 300-minute session window
+- `W`: Codex remaining percentage in the weekly window, or `--` when Codex has not provided a weekly window
+- `C`: Claude remaining percentage in the current 5-hour window, or `--` when unavailable (Claude weekly remaining is shown in the click menu)
 
 ## What It Reads
+
+### Codex (local files only)
 
 Codex writes current thread usage-window updates into the active rollout JSONL session file, whose path is stored in:
 
@@ -15,9 +18,19 @@ Codex writes current thread usage-window updates into the active rollout JSONL s
 ~/.codex/state_5.sqlite
 ```
 
-The app reads recent thread `rollout_path` values from `state_5.sqlite`, scans each rollout tail for `payload.rate_limits`, and displays the newest rate-limit event by timestamp. It does not call the network and does not modify Codex data.
+The app reads recent thread `rollout_path` values from `state_5.sqlite`, scans each rollout tail for `payload.rate_limits`, and displays the newest rate-limit event by timestamp. The Codex path never touches the network and never modifies Codex data.
 
 To avoid repeatedly loading large session files, the app scans from the tail of each recent rollout JSONL file and stops when it finds that file's newest `rate_limits` event.
+
+### Claude (official usage endpoint)
+
+Claude Code does not write its rate-limit percentages to local files, so the app reads the Claude Code OAuth token from the macOS Keychain (`Claude Code-credentials`, via `/usr/bin/security`) and calls Anthropic's usage endpoint every 3 minutes:
+
+```text
+GET https://api.anthropic.com/api/oauth/usage
+```
+
+This is the same source that powers Claude Code's `/usage` command, so the percentages match exactly. The call is read-only. On first launch macOS will show a Keychain permission prompt; choose "Always Allow" to avoid repeat prompts. If the token has expired, run Claude Code once to refresh it; the bar shows `C --` until then.
 
 ## Requirements
 
@@ -51,13 +64,12 @@ build/Codex Token Bar.app
 ./scripts/start.sh
 ```
 
-You should see an `S 79% W 97%` style item in the macOS menu bar. Click it to see:
+You should see an `S 79% W 97% C 82%` style item in the macOS menu bar. Click it to see, for each of Codex and Claude:
 
 - current session remaining
 - this week remaining
-- used percentages
 - reset times
-- source database path
+- data freshness and source
 
 If the current Codex session has not written a fresh `rate_limits` payload yet, the menu bar keeps showing the last known good values and marks them as last known in the tooltip/menu. Expired last-known values are not displayed; on a fresh install or after the cached session window expires, it shows `S -- W --` until the first usable payload appears.
 
