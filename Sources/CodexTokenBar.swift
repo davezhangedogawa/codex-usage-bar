@@ -24,12 +24,24 @@ private enum Subprocess {
         let stderr: String
     }
 
-    static func run(_ executable: String, arguments: [String]) throws -> Output {
+    /// Runs a child process with a hard wall-clock timeout.
+    ///
+    /// Both pipes are drained concurrently with the battle-tested
+    /// readDataToEndOfFile pattern (each on its own thread, so neither pipe
+    /// can fill its 64 KB buffer and block the child). The timeout matters:
+    /// `security` can block indefinitely on a Keychain authorization prompt,
+    /// and without a timeout that would permanently wedge the refresh cycle.
+    static func run(
+        _ executable: String,
+        arguments: [String],
+        timeout: TimeInterval,
+        currentDirectoryPath: String? = nil
+    ) throws -> Output {
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-        let outputQueue = DispatchQueue(label: "codex-token-bar.subprocess-output")
         let drainGroup = DispatchGroup()
+        let exitSemaphore = DispatchSemaphore(value: 0)
         var stdoutData = Data()
         var stderrData = Data()
 
@@ -37,45 +49,53 @@ private enum Subprocess {
         process.arguments = arguments
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+        if let currentDirectoryPath {
+            process.currentDirectoryURL = URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)
+        }
+        process.terminationHandler = { _ in exitSemaphore.signal() }
 
         try process.run()
 
-        // Drain both pipes concurrently so neither can fill its 64 KB buffer
-        // and block the child. The handler is the ONLY reader of each handle
-        // (mixing readabilityHandler with readDataToEndOfFile races), and it
-        // uninstalls itself on EOF so it never spins on empty reads. Handlers
-        // are installed after run(); the microseconds in between only buffer
-        // into the pipe and are drained immediately afterwards.
-        func startDraining(_ handle: FileHandle, into append: @escaping (Data) -> Void) {
-            drainGroup.enter()
-            handle.readabilityHandler = { handle in
-                let chunk = handle.availableData
-                if chunk.isEmpty {
-                    handle.readabilityHandler = nil
-                    drainGroup.leave()
-                } else {
-                    append(chunk)
-                }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            drainGroup.leave()
+        }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            drainGroup.leave()
+        }
+
+        if exitSemaphore.wait(timeout: .now() + timeout) != .success {
+            process.terminate()
+            if exitSemaphore.wait(timeout: .now() + 2) != .success {
+                kill(process.processIdentifier, SIGKILL)
+                _ = exitSemaphore.wait(timeout: .now() + 2)
             }
-        }
-        startDraining(stdoutPipe.fileHandleForReading) { chunk in
-            outputQueue.sync { stdoutData.append(chunk) }
-        }
-        startDraining(stderrPipe.fileHandleForReading) { chunk in
-            outputQueue.sync { stderrData.append(chunk) }
+            _ = drainGroup.wait(timeout: .now() + 2)
+            throw SubprocessError.timeout(executable)
         }
 
-        process.waitUntilExit()
-        // EOF is guaranteed shortly after exit for these tools; the timeout is
-        // a safety net so a stuck pipe degrades to truncated output, not a hang.
-        _ = drainGroup.wait(timeout: .now() + 10)
+        // EOF follows exit almost immediately for these tools; the wait bounds
+        // the pathological case instead of hanging the caller.
+        _ = drainGroup.wait(timeout: .now() + 5)
 
-        return outputQueue.sync {
-            Output(
-                status: process.terminationStatus,
-                stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-                stderr: String(data: stderrData, encoding: .utf8) ?? ""
-            )
+        return Output(
+            status: process.terminationStatus,
+            stdout: String(data: stdoutData, encoding: .utf8) ?? "",
+            stderr: String(data: stderrData, encoding: .utf8) ?? ""
+        )
+    }
+
+    enum SubprocessError: LocalizedError {
+        case timeout(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .timeout(let executable):
+                return "\(executable) did not finish in time (possibly waiting for a Keychain prompt)."
+            }
         }
     }
 }
@@ -113,13 +133,25 @@ private final class RateLimitReader {
     private static let initialTailReadBytes: UInt64 = 256 * 1024
     private static let maxTailReadBytes: UInt64 = 4 * 1024 * 1024
 
-    private let stateDbPath: String
+    // Codex has moved its state database between versions (newer builds keep
+    // it under ~/.codex/sqlite/). Both locations are tried in order and the
+    // first one that answers wins; a stale file left at the old path fails
+    // every query with SQLITE_CANTOPEN (14).
+    private let stateDbPaths: [String]
+    private let sessionsRootPath: String
     private var latestSourcePath: String
     private var snapshotCache: [String: CachedRolloutSnapshot] = [:]
 
-    init(stateDbPath: String = "\(NSHomeDirectory())/.codex/state_5.sqlite") {
-        self.stateDbPath = stateDbPath
-        self.latestSourcePath = stateDbPath
+    init(
+        stateDbPaths: [String] = [
+            "\(NSHomeDirectory())/.codex/sqlite/state_5.sqlite",
+            "\(NSHomeDirectory())/.codex/state_5.sqlite"
+        ],
+        sessionsRootPath: String = "\(NSHomeDirectory())/.codex/sessions"
+    ) {
+        self.stateDbPaths = stateDbPaths
+        self.sessionsRootPath = sessionsRootPath
+        self.latestSourcePath = stateDbPaths.first ?? sessionsRootPath
     }
 
     func read() throws -> RateLimitSnapshot {
@@ -211,10 +243,41 @@ private final class RateLimitReader {
     }
 
     private func readRecentRolloutPaths() throws -> [String] {
-        guard FileManager.default.fileExists(atPath: stateDbPath) else {
-            throw ReaderError.databaseMissing(stateDbPath)
+        var paths: [String] = []
+        var sqliteError: Error? = ReaderError.databaseMissing(stateDbPaths.first ?? "~/.codex")
+
+        for dbPath in stateDbPaths where FileManager.default.fileExists(atPath: dbPath) {
+            do {
+                paths.append(contentsOf: try readRecentRolloutPathsFromStateDatabase(dbPath: dbPath))
+                sqliteError = nil
+                break
+            } catch {
+                sqliteError = error
+            }
         }
 
+        paths.append(contentsOf: recentRolloutPathsFromFilesystem(limit: 24))
+
+        var seen = Set<String>()
+        let uniquePaths = paths.filter { path in
+            guard !path.isEmpty, FileManager.default.fileExists(atPath: path), !seen.contains(path) else {
+                return false
+            }
+            seen.insert(path)
+            return true
+        }
+
+        guard !uniquePaths.isEmpty else {
+            if let sqliteError {
+                throw sqliteError
+            }
+            throw ReaderError.noRolloutPath
+        }
+
+        return uniquePaths
+    }
+
+    private func readRecentRolloutPathsFromStateDatabase(dbPath: String) throws -> [String] {
         let sql = """
         SELECT rollout_path
         FROM threads
@@ -225,7 +288,8 @@ private final class RateLimitReader {
 
         let output = try Subprocess.run(
             "/usr/bin/sqlite3",
-            arguments: ["-readonly", "-separator", "\t", stateDbPath, sql]
+            arguments: ["-readonly", "-separator", "\t", dbPath, sql],
+            timeout: 10
         )
         guard output.status == 0 else {
             let message = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -235,13 +299,35 @@ private final class RateLimitReader {
         let paths = output.stdout
             .split(separator: "\n", omittingEmptySubsequences: true)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && FileManager.default.fileExists(atPath: $0) }
-
-        guard !paths.isEmpty else {
-            throw ReaderError.noRolloutPath
-        }
 
         return paths
+    }
+
+    private func recentRolloutPathsFromFilesystem(limit: Int) -> [String] {
+        let rootURL = URL(fileURLWithPath: sessionsRootPath, isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        var candidates: [(path: String, modifiedAt: Date)] = []
+        for case let url as URL in enumerator {
+            guard url.lastPathComponent.hasPrefix("rollout-"),
+                  url.pathExtension == "jsonl",
+                  (try? url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true else {
+                continue
+            }
+            let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            candidates.append((url.path, modifiedAt))
+        }
+
+        return candidates
+            .sorted { lhs, rhs in lhs.modifiedAt > rhs.modifiedAt }
+            .prefix(limit)
+            .map(\.path)
     }
 
     private func readRolloutTail(from path: String) throws -> String {
@@ -306,9 +392,9 @@ private final class RateLimitReader {
             case .databaseMissing(let path):
                 return "Codex usage source was not found at \(path)."
             case .noRolloutPath:
-                return "No current Codex rollout path was found in the local state database."
+                return "No recent Codex rollout files were found in the state database or sessions folder."
             case .noRateLimitEvent:
-                return "No rate_limits payload was found in the current Codex session file yet."
+                return "No rate_limits payload was found in recent Codex session files yet."
             case .invalidRolloutEncoding(let path):
                 return "The Codex session file could not be read as UTF-8: \(path)."
             case .sqlite(let message):
@@ -404,7 +490,62 @@ private final class ClaudeUsageReader {
     private static let userAgent = "claude-code/2.0.0"
     private static let tokenExpiryMargin: TimeInterval = 60
 
+    // Candidate install locations for the Claude Code CLI. A GUI app launched
+    // by LaunchServices does not inherit the user's shell PATH, so absolute
+    // paths are tried directly before falling back to a login-shell lookup.
+    private static let claudeBinaryCandidates = [
+        "\(NSHomeDirectory())/.local/bin/claude",
+        "\(NSHomeDirectory())/.claude/local/claude",
+        "/usr/local/bin/claude",
+        "/opt/homebrew/bin/claude"
+    ]
+
     private var cachedToken: (value: String, expiresAt: Date)?
+
+    /// Forget the cached token so the next read re-reads the Keychain. Called
+    /// after a login refresh so a freshly minted token is picked up at once.
+    func invalidateCachedToken() {
+        cachedToken = nil
+    }
+
+    /// Runs the Claude Code CLI once in headless mode. On startup the CLI
+    /// exchanges the stored refresh token for a new access token and writes it
+    /// back to the Keychain, which is exactly what an idle machine needs. This
+    /// uses the user's own official client (no impersonation) and costs a
+    /// negligible sliver of usage for the one-word prompt.
+    func refreshLogin() throws {
+        guard let binary = Self.locateClaudeBinary() else {
+            throw ReaderError.cliNotFound
+        }
+
+        let output = try Subprocess.run(
+            binary,
+            arguments: ["-p", "ping"],
+            timeout: 90,
+            currentDirectoryPath: NSHomeDirectory()
+        )
+        guard output.status == 0 else {
+            let message = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw ReaderError.cliFailed(message.isEmpty ? "exit code \(output.status)" : message)
+        }
+        invalidateCachedToken()
+    }
+
+    private static func locateClaudeBinary() -> String? {
+        if let direct = claudeBinaryCandidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            return direct
+        }
+        // Last resort: ask a login shell, which sources the user's PATH.
+        guard let output = try? Subprocess.run(
+            "/bin/zsh",
+            arguments: ["-lc", "command -v claude"],
+            timeout: 10
+        ), output.status == 0 else {
+            return nil
+        }
+        let path = output.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
 
     func read() throws -> ClaudeUsageSnapshot {
         let token = try accessToken()
@@ -449,9 +590,14 @@ private final class ClaudeUsageReader {
         }
         cachedToken = nil
 
+        // Generous timeout: the first call can show a Keychain authorization
+        // prompt that the user needs time to approve ("Always Allow" stops it
+        // from reappearing). A hard cap still prevents a permanent hang when
+        // the prompt is dismissed to the background or ignored.
         let output = try Subprocess.run(
             "/usr/bin/security",
-            arguments: ["find-generic-password", "-s", Self.keychainService, "-w"]
+            arguments: ["find-generic-password", "-s", Self.keychainService, "-w"],
+            timeout: 120
         )
         guard output.status == 0 else {
             throw ReaderError.keychainUnavailable(output.stderr.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -465,13 +611,20 @@ private final class ClaudeUsageReader {
             throw ReaderError.credentialsUnreadable
         }
 
-        // expiresAt is stored as milliseconds since the epoch.
-        let expiresAt = oauth.expiresAt.map { Date(timeIntervalSince1970: $0 / 1000) } ?? .distantFuture
-        guard expiresAt > Date().addingTimeInterval(Self.tokenExpiryMargin) else {
-            throw ReaderError.tokenExpired
+        // expiresAt has been observed in milliseconds; tolerate seconds too
+        // (values above ~5138 AD in seconds must be milliseconds).
+        let expiresAt = oauth.expiresAt.map { raw in
+            Date(timeIntervalSince1970: raw > 1e11 ? raw / 1000 : raw)
         }
 
-        cachedToken = (token, expiresAt)
+        // Do NOT reject a locally "expired" token: the server is the source
+        // of truth (a unit mismatch or clock skew would otherwise wedge the
+        // reader forever). An actually dead token comes back as HTTP 401.
+        // Only cache while the local expiry still looks valid, so a token
+        // refreshed by Claude Code is picked up on the next cycle.
+        if let expiresAt, expiresAt > Date().addingTimeInterval(Self.tokenExpiryMargin) {
+            cachedToken = (token, expiresAt)
+        }
         return token
     }
 
@@ -503,12 +656,13 @@ private final class ClaudeUsageReader {
     enum ReaderError: LocalizedError {
         case keychainUnavailable(String)
         case credentialsUnreadable
-        case tokenExpired
         case unauthorized
         case badResponse
         case timeout
         case httpStatus(Int)
         case missingUsageData
+        case cliNotFound
+        case cliFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -518,10 +672,12 @@ private final class ClaudeUsageReader {
                     : "Keychain read failed: \(message)"
             case .credentialsUnreadable:
                 return "Claude Code Keychain item could not be parsed."
-            case .tokenExpired:
-                return "Claude Code OAuth token has expired. Run Claude Code once to refresh it."
             case .unauthorized:
-                return "Anthropic rejected the token (401). Run Claude Code once to refresh it."
+                return "Anthropic rejected the token (401): it has likely expired. Use \"Refresh Claude Login\" from the menu, or run Claude Code once; the bar recovers within 3 minutes."
+            case .cliNotFound:
+                return "The claude command was not found. Install Claude Code, or refresh by running it once yourself."
+            case .cliFailed(let message):
+                return "Refreshing the Claude login failed: \(message)"
             case .badResponse:
                 return "The Anthropic usage endpoint returned an unreadable response."
             case .timeout:
@@ -652,9 +808,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestClaudeSnapshot: ClaudeUsageSnapshot?
     private var claudeSnapshotIsStale = false
     private var latestClaudeError: Error?
+    private var claudeLoginRefreshInProgress = false
+    private var claudeLoginRefreshStatus: String?
 
-    private var lastLoggedErrorMessage: String?
-    private var lastLoggedErrorAt: Date?
+    // Throttle state is kept per source: Codex and Claude errors alternate
+    // in the log, and a single "last message" slot would see every entry as
+    // "new" and never throttle anything.
+    private var lastLoggedErrors: [String: (message: String, at: Date)] = [:]
     private lazy var logURL: URL = {
         let logDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/CodexUsageBar", isDirectory: true)
@@ -731,6 +891,36 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Runs the official Claude Code CLI once to refresh the OAuth token, then
+    /// immediately re-reads usage. Serialized on the same queue as reads so it
+    /// cannot overlap a normal Claude refresh.
+    private func refreshClaudeLogin() {
+        guard !claudeLoginRefreshInProgress else { return }
+        claudeLoginRefreshInProgress = true
+        claudeLoginRefreshStatus = "Refreshing Claude login…"
+        rebuildMenu()
+
+        claudeRefreshQueue.async { [weak self] in
+            guard let self else { return }
+            let result = Result { try self.claudeReader.refreshLogin() }
+            DispatchQueue.main.async {
+                self.claudeLoginRefreshInProgress = false
+                switch result {
+                case .success:
+                    self.claudeLoginRefreshStatus = "Login refreshed"
+                    self.logErrorIfNeeded(source: "claude-login", "refreshed")
+                case .failure(let error):
+                    self.claudeLoginRefreshStatus = "Refresh failed: \(error.localizedDescription)"
+                    self.logErrorIfNeeded(source: "claude-login", error.localizedDescription)
+                }
+                self.rebuildMenu()
+                // Pull fresh usage regardless; on success it now succeeds, on
+                // failure it restores the normal error text.
+                self.refreshClaude()
+            }
+        }
+    }
+
     private func applyCodexResult(_ result: Result<RateLimitSnapshot, Error>) {
         switch result {
         case .success(let snapshot) where isCodexSnapshotDisplayable(snapshot):
@@ -756,7 +946,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             latestCodexSnapshot = nil
             codexSnapshotIsStale = false
         }
-        logErrorIfNeeded("codex refresh error \(error.localizedDescription)")
+        logErrorIfNeeded(source: "codex", error.localizedDescription)
     }
 
     private func applyClaudeResult(_ result: Result<ClaudeUsageSnapshot, Error>) {
@@ -784,7 +974,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             latestClaudeSnapshot = nil
             claudeSnapshotIsStale = false
         }
-        logErrorIfNeeded("claude refresh error \(error.localizedDescription)")
+        logErrorIfNeeded(source: "claude", error.localizedDescription)
     }
 
     // MARK: Status item
@@ -811,15 +1001,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let top = providerStatusLine(
             provider: "Codex",
-            session: latestCodexSnapshot?.sessionRemainingPercent,
-            week: latestCodexSnapshot?.weekRemainingPercent,
+            session: effectiveValue(latestCodexSnapshot?.sessionRemainingPercent, resetAt: latestCodexSnapshot?.sessionResetAt),
+            week: effectiveValue(latestCodexSnapshot?.weekRemainingPercent, resetAt: latestCodexSnapshot?.weekResetAt),
             font: font,
             palette: palette
         )
         let bottom = providerStatusLine(
             provider: "Claude",
-            session: latestClaudeSnapshot?.sessionRemainingPercent,
-            week: latestClaudeSnapshot?.weekRemainingPercent,
+            session: effectiveValue(latestClaudeSnapshot?.sessionRemainingPercent, resetAt: latestClaudeSnapshot?.sessionResetAt),
+            week: effectiveValue(latestClaudeSnapshot?.weekRemainingPercent, resetAt: latestClaudeSnapshot?.weekResetAt),
             font: font,
             palette: palette
         )
@@ -861,14 +1051,21 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private func tooltipText() -> String {
         var lines: [String] = []
         if let snapshot = latestCodexSnapshot {
+            let session = effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)
+            let week = effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)
             let suffix = codexSnapshotIsStale ? " (last known, read \(formatAge(since: snapshot.readAt)))" : ""
-            lines.append("Codex: session (S) \(snapshot.sessionRemainingPercent)%, weekly (W) \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
+            lines.append("Codex: session (S) \(formatPercent(session)), weekly (W) \(formatPercent(week)) remaining\(suffix)")
+            if session == nil {
+                lines.append("Codex session window has reset; waiting for the next Codex activity.")
+            }
         } else {
             lines.append("Codex usage is not available yet\(latestCodexError.map { ": \($0.localizedDescription)" } ?? "")")
         }
         if let snapshot = latestClaudeSnapshot {
+            let session = effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)
+            let week = effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)
             let suffix = claudeSnapshotIsStale ? " (last known, read \(formatAge(since: snapshot.readAt)))" : ""
-            lines.append("Claude: session (S) \(snapshot.sessionRemainingPercent)%, weekly (W) \(formatPercent(snapshot.weekRemainingPercent)) remaining\(suffix)")
+            lines.append("Claude: session (S) \(formatPercent(session)), weekly (W) \(formatPercent(week)) remaining\(suffix)")
         } else {
             lines.append("Claude usage is not available yet\(latestClaudeError.map { ": \($0.localizedDescription)" } ?? "")")
         }
@@ -882,8 +1079,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
         addHeader(codexSnapshotIsStale ? "Codex Usage (Last Known)" : "Codex Usage", to: menu)
         if let snapshot = latestCodexSnapshot {
-            addValue("Session remaining (S)", value: "\(snapshot.sessionRemainingPercent)%", to: menu)
-            addValue("Weekly remaining (W)", value: formatPercent(snapshot.weekRemainingPercent), to: menu)
+            let session = effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)
+            let week = effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)
+            addValue("Session remaining (S)", value: session.map { "\($0)%" } ?? "window reset, waiting for new Codex activity", to: menu)
+            addValue("Weekly remaining (W)", value: formatPercent(week), to: menu)
             addValue("Plan", value: snapshot.planType, to: menu)
             addValue("Status", value: snapshot.limitReached ? "limit reached" : (snapshot.allowed ? "allowed" : "not allowed"), to: menu)
             if let sessionReset = snapshot.sessionResetAt {
@@ -908,8 +1107,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         addHeader(claudeSnapshotIsStale ? "Claude Usage (Last Known)" : "Claude Usage", to: menu)
         if let snapshot = latestClaudeSnapshot {
-            addValue("Session remaining (S)", value: "\(snapshot.sessionRemainingPercent)%", to: menu)
-            addValue("Weekly remaining (W)", value: formatPercent(snapshot.weekRemainingPercent), to: menu)
+            let session = effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)
+            let week = effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)
+            addValue("Session remaining (S)", value: session.map { "\($0)%" } ?? "window reset, waiting for fresh data", to: menu)
+            addValue("Weekly remaining (W)", value: formatPercent(week), to: menu)
             if let sessionReset = snapshot.sessionResetAt {
                 addValue("Session resets", value: Self.dateFormatter.string(from: sessionReset), to: menu)
             }
@@ -925,11 +1126,23 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         if let error = latestClaudeError {
             addValue("Error", value: error.localizedDescription, to: menu)
         }
+        if let status = claudeLoginRefreshStatus {
+            addValue("Login refresh", value: status, to: menu)
+        }
 
         menu.addItem(.separator())
         let refreshItem = NSMenuItem(title: "Refresh Now", action: #selector(refreshFromMenu), keyEquivalent: "r")
         refreshItem.target = self
         menu.addItem(refreshItem)
+
+        let refreshLoginItem = NSMenuItem(
+            title: claudeLoginRefreshInProgress ? "Refreshing Claude Login…" : "Refresh Claude Login",
+            action: #selector(refreshClaudeLoginFromMenu),
+            keyEquivalent: ""
+        )
+        refreshLoginItem.target = self
+        refreshLoginItem.isEnabled = !claudeLoginRefreshInProgress
+        menu.addItem(refreshLoginItem)
 
         let copyItem = NSMenuItem(title: "Copy Summary", action: #selector(copySummary), keyEquivalent: "c")
         copyItem.target = self
@@ -970,18 +1183,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshClaude()
     }
 
+    @objc private func refreshClaudeLoginFromMenu() {
+        refreshClaudeLogin()
+    }
+
     @objc private func copySummary() {
         var lines: [String] = []
         if let snapshot = latestCodexSnapshot {
             let suffix = codexSnapshotIsStale ? " (last known)" : ""
-            lines.append("Codex session (S) remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
-            lines.append("Codex weekly (W) remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
+            lines.append("Codex session (S) remaining: \(formatPercent(effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)))\(suffix)")
+            lines.append("Codex weekly (W) remaining: \(formatPercent(effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)))\(suffix)")
             lines.append("Codex source: \(snapshot.sourcePath ?? codexReader.sourceDescription)")
         }
         if let snapshot = latestClaudeSnapshot {
             let suffix = claudeSnapshotIsStale ? " (last known)" : ""
-            lines.append("Claude session (S) remaining: \(snapshot.sessionRemainingPercent)%\(suffix)")
-            lines.append("Claude weekly (W) remaining: \(formatPercent(snapshot.weekRemainingPercent))\(suffix)")
+            lines.append("Claude session (S) remaining: \(formatPercent(effectiveValue(snapshot.sessionRemainingPercent, resetAt: snapshot.sessionResetAt)))\(suffix)")
+            lines.append("Claude weekly (W) remaining: \(formatPercent(effectiveValue(snapshot.weekRemainingPercent, resetAt: snapshot.weekResetAt)))\(suffix)")
         }
         guard !lines.isEmpty else { return }
 
@@ -1033,27 +1250,30 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(data, forKey: key)
     }
 
+    // Expiry is judged PER WINDOW, not per snapshot. A lapsed 5-hour session
+    // window only invalidates the session value (the window has reset and no
+    // fresh event exists yet); the weekly window usually resets much later
+    // and stays perfectly valid. Discarding the whole snapshot used to blank
+    // the entire bar every time Codex sat idle past one session window.
+    // Only overall age still expires a snapshot as a whole.
+
     private func isCodexSnapshotDisplayable(_ snapshot: RateLimitSnapshot) -> Bool {
-        let now = Date()
-        if let sessionResetAt = snapshot.sessionResetAt, sessionResetAt <= now {
-            return false
-        }
-        if let basis = snapshot.readAt ?? snapshot.eventAt,
-           now.timeIntervalSince(basis) > Self.maxSnapshotAge {
-            return false
-        }
-        return true
+        guard let basis = snapshot.readAt ?? snapshot.eventAt else { return false }
+        return Date().timeIntervalSince(basis) <= Self.maxSnapshotAge
     }
 
     private func isClaudeSnapshotDisplayable(_ snapshot: ClaudeUsageSnapshot) -> Bool {
-        let now = Date()
-        if let sessionResetAt = snapshot.sessionResetAt, sessionResetAt <= now {
-            return false
+        guard let basis = snapshot.readAt else { return false }
+        return Date().timeIntervalSince(basis) <= Self.maxSnapshotAge
+    }
+
+    /// Returns nil for a window whose reset time has already passed.
+    private func effectiveValue(_ value: Int?, resetAt: Date?) -> Int? {
+        guard let value else { return nil }
+        if let resetAt, resetAt <= Date() {
+            return nil
         }
-        if let basis = snapshot.readAt, now.timeIntervalSince(basis) > Self.maxSnapshotAge {
-            return false
-        }
-        return true
+        return value
     }
 
     // MARK: Formatting and logging
@@ -1089,16 +1309,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func logErrorIfNeeded(_ message: String) {
+    private func logErrorIfNeeded(source: String, _ message: String) {
         let now = Date()
-        let shouldLog = message != lastLoggedErrorMessage
-            || lastLoggedErrorAt.map { now.timeIntervalSince($0) >= Self.repeatedErrorLogInterval } ?? true
+        if let last = lastLoggedErrors[source],
+           last.message == message,
+           now.timeIntervalSince(last.at) < Self.repeatedErrorLogInterval {
+            return
+        }
 
-        guard shouldLog else { return }
-
-        lastLoggedErrorMessage = message
-        lastLoggedErrorAt = now
-        log(message)
+        lastLoggedErrors[source] = (message, now)
+        log("\(source) refresh error \(message)")
     }
 
     private func rotateLogIfNeeded(incomingBytes: UInt64) {

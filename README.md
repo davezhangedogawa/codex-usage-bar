@@ -15,13 +15,9 @@ Claude S82 W64   <- Claude: session / weekly remaining
 
 ### Codex (local files only)
 
-Codex writes current thread usage-window updates into the active rollout JSONL session file, whose path is stored in:
+Codex writes current thread usage-window updates into the active rollout JSONL session file, whose path is stored in a state database. Newer Codex builds keep it at `~/.codex/sqlite/state_5.sqlite`, older ones at `~/.codex/state_5.sqlite`; the app tries both in that order.
 
-```text
-~/.codex/state_5.sqlite
-```
-
-The app reads recent thread `rollout_path` values from `state_5.sqlite`, scans each rollout tail for `payload.rate_limits`, and displays the newest rate-limit event by timestamp. The Codex path never touches the network and never modifies Codex data.
+The app reads recent thread `rollout_path` values from the state database, scans each rollout tail for `payload.rate_limits`, and displays the newest rate-limit event by timestamp. If the SQLite read fails, it falls back to scanning recent rollout files under `~/.codex/sessions`. The Codex path never touches the network and never modifies Codex data.
 
 To avoid repeatedly loading large session files, the app scans from the tail of each recent rollout JSONL file and stops when it finds that file's newest `rate_limits` event.
 
@@ -33,7 +29,9 @@ Claude Code does not write its rate-limit percentages to local files, so the app
 GET https://api.anthropic.com/api/oauth/usage
 ```
 
-This is the same source that powers Claude Code's `/usage` command, so the percentages match exactly. The call is read-only. On first launch macOS will show a Keychain permission prompt; choose "Always Allow" to avoid repeat prompts. If the token has expired, run Claude Code once to refresh it; the bar shows `C --` until then.
+This is the same source that powers Claude Code's `/usage` command, so the percentages match exactly. The call is read-only. On first launch macOS will show a Keychain permission prompt; choose "Always Allow" to avoid repeat prompts.
+
+The stored token is refreshed by Claude Code itself. If you rarely run Claude Code the access token eventually expires and the Claude row shows `S-- W--`. Rather than opening a terminal, use the **Refresh Claude Login** menu item: it runs your own installed `claude` command once in the background (a one-word headless prompt), which makes the official client mint a fresh token and write it back to the Keychain. The bar then recovers on the next cycle. This uses your real Claude Code client, not a re-implementation, and costs a negligible sliver of usage. The menu item looks for `claude` in the usual install locations and, failing that, via a login shell.
 
 ## Requirements
 
@@ -74,7 +72,7 @@ You should see a compact two-line `Codex S79 W97 / Claude S82 W64` item in the m
 - reset times
 - data freshness and source
 
-If the current Codex session has not written a fresh `rate_limits` payload yet, the menu bar keeps showing the last known good values and marks them as last known in the tooltip/menu. Expired last-known values are not displayed; on a fresh install or after the cached session window expires, it shows `S -- W --` until the first usable payload appears.
+If the current Codex session has not written a fresh `rate_limits` payload yet, the menu bar keeps showing the last known good values and marks them as last known in the tooltip/menu. Expiry is judged per window: when a 5-hour session window has lapsed, only `S` falls back to `--` (the window has reset and there is no fresh event yet) while the still-valid weekly value keeps showing. A snapshot older than 6 hours is dropped entirely.
 
 To stop it:
 
